@@ -1,0 +1,6 @@
+ultralytics==8.3.40
+supervision==0.1.0
+opencv-python
+numpy
+pandas
+pyyaml
