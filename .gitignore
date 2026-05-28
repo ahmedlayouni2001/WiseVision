@@ -12,6 +12,7 @@ build/
 venv/
 env/
 .venv/
+main1_bytetrack.py/
 
 # Model weights
 *.pt
