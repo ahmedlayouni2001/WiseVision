@@ -52,5 +52,9 @@ seller_ref2/
 !bot-sort-version/reference_image/
 !bot-sort-version/reference_image/*
 
-# NOTE: requirements*.txt and solution*.txt are intentionally tracked
+# NOTE: requirements1/2.txt and solution1/2.txt are intentionally tracked
 # (no global *.txt ignore).
+
+# Superseded / local-only — keep out of GitHub
+requirements.txt
+our solution.txt
