@@ -1,0 +1,258 @@
+# PEC interaction-code patch
+
+Replaces the old `seller_interactions` / `interaction_start` interaction logic
+with **position-anchored PEC** counting.
+
+What it does: one engagement at a time, anchored to the *served client's position*
+(not a track id). The PEC ends when that position leaves for `PEC_GRACE_SECS`,
+even if other people are still standing near the seller (a bystander passing
+behind does not extend or split the event). Because the anchor is position, a
+client whose id churns mid-conversation stays ONE PEC, and when the served client
+leaves the counter is free to fire again on the next engagement.
+
+Apply these 7 edits. Nothing outside the interaction logic changes
+(YOLO, BoT-SORT, RoleTracker, seller anchors, line crossing are untouched).
+
+---
+
+## Edit 1 — CONFIG: add the PEC constants
+
+Right after the line:
+
+```python
+INTERACTION_DIST           = 350
+```
+
+add:
+
+```python
+# --- PEC (Pris En Charge): ONE engagement at a time, tied to the served client's
+#     POSITION (not id). Ends when THAT position leaves, even if other people are
+#     near the seller. Position-based => id churn within one chat stays one PEC. ---
+PEC_PROX_DIST   = INTERACTION_DIST  # px bbox-gap to seller to be a candidate
+PEC_MIN_SECS    = 5.0     # continuous engagement before it counts (rejects pass-bys)
+PEC_GRACE_SECS  = 12      # engagement survives this long with the served client unseen
+PEC_FOLLOW_DIST = 160     # px the served client may move and still be "the same one"
+PEC_EMA         = 0.5     # served-position smoothing (0..1, higher = stickier)
+```
+
+---
+
+## Edit 2 — main(): replace the interaction state variables
+
+**Find** (inside `main()`):
+
+```python
+    interaction_start: Dict[int, float] = {}
+    seller_interactions: Dict[int, float] = {}
+```
+
+**Replace with:**
+
+```python
+    # --- PEC state: at most one active engagement, anchored to a position ---
+    pec_active    = False
+    pec_count     = 0
+    pec_start_t   = None
+    pec_last_t    = None       # last time the served client was seen near the seller
+    pec_pos       = None       # (cx, cy) of the client currently being served
+    pec_counted   = False
+    pec_durations = []
+```
+
+---
+
+## Edit 3 — skip-frame branch: use `pec_count` in the draw call
+
+**Find:**
+
+```python
+                draw_frame(frame, last_persons, in_count,
+                           len(seller_interactions))
+```
+
+**Replace with:**
+
+```python
+                draw_frame(frame, last_persons, in_count, pec_count)
+```
+
+---
+
+## Edit 4 — replace the whole "4) Interaction detection" block
+
+**Find** (the entire old block):
+
+```python
+            # 4) Interaction detection (unchanged)
+            INTERACTION_MIN_SECS = 5.0
+            seller_person   = next((p for p in persons if p.role == "SELLER"), None)
+            currently_close = set()
+            if seller_person is not None:
+                sx1, sy1, sx2, sy2 = seller_person.bbox
+                for p in persons:
+                    if p.role != "CLIENT":
+                        continue
+                    fid = p.first_pid
+                    if fid in seller_interactions:
+                        continue
+                    cx1, cy1, cx2, cy2 = p.bbox
+                    gap_x = max(0, max(cx1, sx1) - min(cx2, sx2))
+                    gap_y = max(0, max(cy1, sy1) - min(cy2, sy2))
+                    if np.sqrt(gap_x ** 2 + gap_y ** 2) < INTERACTION_DIST:
+                        currently_close.add(fid)
+                        if fid not in interaction_start:
+                            interaction_start[fid] = timestamp
+                        elif timestamp - interaction_start[fid] >= INTERACTION_MIN_SECS:
+                            seller_interactions[fid] = interaction_start.pop(fid)
+            for fid in list(interaction_start):
+                if fid not in currently_close:
+                    del interaction_start[fid]
+```
+
+**Replace with:**
+
+```python
+            # 4) PEC (Pris En Charge) - ONE engagement, anchored to the served
+            #    client's POSITION. While engaged we follow the nearest client to
+            #    pec_pos; the PEC ends when THAT position is gone for PEC_GRACE_SECS,
+            #    regardless of other people standing near the seller. So a second
+            #    client passing behind does NOT extend or split the event, and the
+            #    counter is free to fire again on the next real engagement. The
+            #    anchor is position (not id) => id churn within one chat = one PEC.
+            #    While the seller is not visible, the PEC pauses (no open/close/age),
+            #    so a storage-room trip doesn't split or drop the event.
+            seller_person = next((p for p in persons if p.role == "SELLER"), None)
+
+            if seller_person is not None:
+                sx1, sy1, sx2, sy2 = seller_person.bbox
+                contacts = []
+                for p in persons:
+                    if p.role != "CLIENT":
+                        continue
+                    cx1, cy1, cx2, cy2 = p.bbox
+                    gap_x = max(0, max(cx1, sx1) - min(cx2, sx2))
+                    gap_y = max(0, max(cy1, sy1) - min(cy2, sy2))
+                    if np.sqrt(gap_x ** 2 + gap_y ** 2) < PEC_PROX_DIST:
+                        contacts.append(((cx1 + cx2) / 2, (cy1 + cy2) / 2))
+
+                if pec_active:
+                    # follow ONLY the served client: nearest contact to pec_pos
+                    best = None; best_d = PEC_FOLLOW_DIST
+                    for ccx, ccy in contacts:
+                        d = np.sqrt((ccx - pec_pos[0]) ** 2 + (ccy - pec_pos[1]) ** 2)
+                        if d < best_d:
+                            best_d, best = d, (ccx, ccy)
+                    if best is not None:                  # served client still here
+                        pec_pos = (PEC_EMA * pec_pos[0] + (1 - PEC_EMA) * best[0],
+                                   PEC_EMA * pec_pos[1] + (1 - PEC_EMA) * best[1])
+                        pec_last_t = timestamp
+                        if not pec_counted and timestamp - pec_start_t >= PEC_MIN_SECS:
+                            pec_count += 1
+                            pec_counted = True
+                    elif timestamp - pec_last_t > PEC_GRACE_SECS:
+                        if pec_counted:
+                            pec_durations.append(pec_last_t - pec_start_t)
+                        pec_active = False; pec_pos = None
+                else:
+                    # not engaged: a client at the counter opens an engagement.
+                    # pick the contact closest to the seller as the served one.
+                    if contacts:
+                        scx = (sx1 + sx2) / 2; scy = (sy1 + sy2) / 2
+                        served = min(contacts, key=lambda c: (c[0]-scx)**2 + (c[1]-scy)**2)
+                        pec_active = True; pec_counted = False
+                        pec_pos = served
+                        pec_start_t = timestamp; pec_last_t = timestamp
+            # else: seller not visible -> pause (don't open, close, or age the PEC)
+```
+
+---
+
+## Edit 5 — step "6) Draw + write": use `pec_count`
+
+**Find:**
+
+```python
+            draw_frame(frame, persons, in_count, len(seller_interactions))
+```
+
+**Replace with:**
+
+```python
+            draw_frame(frame, persons, in_count, pec_count)
+```
+
+---
+
+## Edit 6 — after the loop: flush an open engagement + compute average
+
+The `with sv.VideoSink(...) as sink:` block ends and is followed by:
+
+```python
+    del model, botsort
+```
+
+**Insert these lines immediately BEFORE `del model, botsort`:**
+
+```python
+    # close out an engagement still open at end of footage
+    if pec_active and pec_counted and pec_start_t is not None and pec_last_t is not None:
+        pec_durations.append(pec_last_t - pec_start_t)
+
+    avg_pec = (sum(pec_durations) / len(pec_durations)) if pec_durations else 0.0
+```
+
+---
+
+## Edit 7 — final printout
+
+**Find:**
+
+```python
+    print(f"Interactions     : {len(seller_interactions)}")
+```
+
+**Replace with:**
+
+```python
+    print(f"PEC events       : {pec_count}")
+    print(f"Avg interaction  : {avg_pec:.1f} s")
+```
+
+---
+
+## Optional cosmetic edit — overlay label
+
+In `draw_frame(...)`, the on-screen text still says "Interactions". To match:
+
+**Find:**
+
+```python
+    cv2.putText(frame, f"Clients: {in_count}  Interactions: {interaction_count}",
+```
+
+**Replace with:**
+
+```python
+    cv2.putText(frame, f"Clients: {in_count}  PEC: {interaction_count}",
+```
+
+---
+
+## Tuning knobs (the 3 that matter)
+
+- `PEC_PROX_DIST` (350) — how close a client must be to count as "at the counter".
+- `PEC_FOLLOW_DIST` (160) — how far the served client may drift between frames and
+  still be the same engagement. Raise it if a PEC drops mid-conversation; lower it
+  if a new client stepping up gets absorbed into the previous engagement.
+- `PEC_GRACE_SECS` (12) — how long the served client may vanish (occlusion) before
+  the engagement is declared over.
+
+`PEC_MIN_SECS` (5) is the separate "must last this long to count as real" gate that
+rejects people just walking past the counter.
+
+## Known limitation
+
+One engagement at a time, by design. If the seller genuinely attends two separate
+clients simultaneously, this counts one (a bystander behind the served client is
+intentionally ignored).
