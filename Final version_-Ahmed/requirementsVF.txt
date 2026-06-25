@@ -1,0 +1,23 @@
+# SC.py dependencies (Python 3.10+).
+#
+# Install the pip packages:
+#     pip install -r requirements.txt
+#
+# IMPORTANT - torch/torchvision are GPU (CUDA 11.8) builds here. Install them
+# from the matching PyTorch index (recommended, much faster than CPU):
+#     pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu118
+# For a different CUDA version pick the right index from https://pytorch.org .
+# (CPU-only also works -- the code auto-falls back to CPU, just slower.)
+
+ultralytics==8.4.66
+boxmot==20.0.0
+supervision==0.28.0
+opencv-python==4.13.0.92
+numpy==2.2.6
+torch==2.7.1
+torchvision==0.22.1
+
+# Weights (NOT pip): both auto-download on first run, no manual step needed:
+#   - yolo11m.pt                 (YOLO person detector, via ultralytics)
+#   - osnet_ain_x1_0_msmt17.pt   (OSNet ReID for BoT-SORT, via boxmot)
+# You only need to provide the INPUT VIDEO (set SOURCE_VIDEO_PATH in SC.py).
