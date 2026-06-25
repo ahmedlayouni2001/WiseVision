@@ -1,0 +1,98 @@
+SC.py - SHOP SELLER/CLIENT + ENTRY COUNT + PEC (INTERACTION) COUNT
+==================================================================
+Standalone (no other project file needed). Author: Ahmed.
+
+RUN
+---
+1) pip install -r requirements.txt   (see the torch/CUDA note in that file)
+2) In SC.py set SOURCE_VIDEO_PATH (input) and TARGET_VIDEO_PATH (output).
+3) python SC.py
+Weights (yolo11m.pt, osnet_ain_x1_0_msmt17.pt) auto-download on first run.
+Output: an annotated video + printed totals (Clients entered, PEC events,
+average interaction seconds).
+
+
+WHAT IT DOES (per processed frame, every SKIP-th frame)
+-------------------------------------------------------
+1) DETECT people with YOLO11m.
+2) DROP false detections: MIRROR_ZONES (reflections) and IGNORE_ZONES (static
+   objects YOLO mis-detects, e.g. a handbag) -- by feet-in-polygon.
+3) TRACK with BoT-SORT (+OSNet ReID) -> a track id per detection. The id is used
+   ONLY internally (the role is NOT decided by ReID). No ids are drawn.
+4) SELLER vs CLIENT:
+   - SEED: everyone in the first SEED_SECONDS is a SELLER (bootstraps staff).
+   - UNIFORM: a person is SELLER if their lower body matches the learned BEIGE
+     band AND they show a WHITE top. This VOTES per track: after SELLER_VOTES
+     matching frames the track LOCKS as SELLER and stays SELLER on every later
+     frame (anti-flicker), even when the uniform isn't visible -- as long as
+     BoT-SORT keeps the same id.
+   - DESK ZONE: anyone whose feet are in a SELLER_ZONE is SELLER (covers a SEATED
+     staffer whose beige pants are hidden under the desk -- color can't see them).
+   - Everyone else = CLIENT.
+5) CLIENT ENTRY COUNT: a client crossing the line from OUTSIDE to INSIDE is
+   counted. Matching is by POSITION, not track id (a client seen just-outside
+   near the line, then just-inside near the line shortly after = +1). This is
+   immune to BoT-SORT id churn at the crossing.
+6) PEC (interaction): ONE engagement at a time, anchored to the SERVED client's
+   POSITION. Opens when a client is near any seller; counted after PEC_MIN_SECS
+   of continuous contact; ends when that position is gone for PEC_GRACE_SECS.
+   A bystander passing behind does not split it; id churn mid-chat stays ONE PEC.
+
+
+THE UNIFORM COLOR (production vs re-learn)
+------------------------------------------
+The beige band is BAKED INTO THE CODE (UNIFORM_BAND_LO / UNIFORM_BAND_HI), so in
+production NO image folder is needed (USE_REF_COLORS = False).
+To re-learn it for a NEW uniform / camera:
+  1) put curated seller crops (white top + beige pants) in a folder,
+  2) set SELLER_REF_DIR to it and USE_REF_COLORS = True, run once,
+  3) copy the printed band into UNIFORM_BAND_LO / UNIFORM_BAND_HI,
+  4) set USE_REF_COLORS = False again.
+
+
+ZONES (mark with a polygon picker, paste pixel polygons; coords are for THIS camera)
+------------------------------------------------------------------------------------
+- LINE1_START / LINE1_END : the entry counting line (two points).
+- MIRROR_ZONES            : drop reflected people.
+- IGNORE_ZONES            : drop static false detections (e.g. handbag). Keep TIGHT.
+- SELLER_ZONES            : staff desk/seat -> anyone there is SELLER.
+All zones use FEET (box bottom-center) inside the polygon.
+
+
+IMPORTANT PARAMETERS TO TUNE
+----------------------------
+SELLER vs CLIENT:
+  COLOR_TAKE   (0.30) fraction of lower-body pixels inside the beige band to be
+               "uniform". Lower = catch more sellers (risk tan clients); higher = stricter.
+  WHITE_MIN    (0.25) white-top ratio required.
+  SELLER_VOTES (3)    uniform frames before a track locks SELLER. 1 = instant
+               (risk a client flicker locks); higher = slower but safer.
+  UNIFORM_BAND_LO/HI  the baked-in beige HSV band (re-learn to change).
+
+ENTRY COUNTING (line):
+  LINE1_START/END       position of the counting line.
+  DEADZONE_PX   (8)     ignore wobble within this px of the line.
+  CROSS_NEAR_PX (320)   only count crossings within this px of the line.
+  MATCH_DIST_PX (260)   how far the person may move between the out & in sighting.
+  MATCH_WIN     (15)    max processed-frames between out and in (~2 s).
+  COOLDOWN      (20)    frames a counted spot is suppressed (no double count).
+  CONF_CLIENT   (0.2)   min YOLO confidence for a client to be kept/counted.
+
+PEC (interaction):
+  PEC_PROX_DIST   (350) px gap to a seller to be "at the counter".
+  PEC_MIN_SECS    (8)   continuous seconds before an interaction counts.
+  PEC_GRACE_SECS  (12)  how long the served client may vanish before it ends.
+  PEC_FOLLOW_DIST (160) how far the served client may drift and stay "the same".
+
+GENERAL:
+  DETECT_CONF (0.1) YOLO detection conf (low, to catch faint sellers).
+  SKIP        (3)   process every 3rd frame (speed vs accuracy).
+  DEBUG_CALIB (True) print per-track stats + counts at the end.
+  MAX_FRAMES  (0)   >0 stops early for a quick test.
+
+
+KNOWN LIMITATION
+----------------
+A seller can briefly flip to CLIENT if BoT-SORT changes their track id AND the
+uniform isn't visible at that instant (they must re-vote 3 uniform frames, or be
+in the desk zone). Seed + vote-lock + desk-zone cover most cases, not all.
