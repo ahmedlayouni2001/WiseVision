@@ -81,7 +81,7 @@ COLOR_PCT_HI = 95     # [^]
 COLOR_MARGIN = np.array([4, 15, 30])           # H,S,V padding around the learned band (re-learn only)
 COLOR_TAKE   = 0.30   # [^] fraction of lower-body pixels inside the band to call "uniform"
 WHITE_MIN    = 0.25   # [^] white-top ratio required (white tops are shared, keep modest)
-SELLER_VOTES = 3      # [^] uniform-match frames before a track locks SELLER (anti-flicker)
+SELLER_VOTES = 2     # [^] uniform-match frames before a track locks SELLER (anti-flicker)
 
 # beige pants HSV gate (broad pre-gate when re-learning) + white-top gate
 BEIGE_H_MIN, BEIGE_H_MAX = 22, 55
@@ -94,13 +94,22 @@ WHITE_V_MIN = 85
 SEED_SECONDS   = 3.0     # everyone detected before this is SELLER (+ teaches color if re-learning)
 SEED_BEIGE_MIN = 0.15    # only sample pants color from seed people who actually show beige
 
-# --- line counting (id-FREE position match) ----------------------------------
-LINE1_START, LINE1_END = sv.Point(1782, 852), sv.Point(1713, 1078)   # the counting line
-DEADZONE_PX   = 8     # [^] half-width of the dead band around the line (px)
-CROSS_NEAR_PX = 320   # [^] only consider detections within this |d| of the line (crossing zone)
-MATCH_DIST_PX = 260   # [^] max px between the out-sighting and the in-sighting (person moved a bit)
-MATCH_WIN     = 15    # [^] max processed-frames between out and in (~2s @ skip3/20fps)
-COOLDOWN      = 20    # processed-frames a counted spot is suppressed (no double count)
+# --- ENTREE-ZONE counter (replaces the line) ---------------------------------
+# Count a CLIENT once when ALL 4 hold:
+#   (1) its FEET (bottom-center) are inside ENTREE_ZONE,
+#   (2) its track id has not been counted before,
+#   (3) it is a CLIENT,
+#   (4) it is moving INTO the shop (its signed distance to LINE1 moved inward
+#       since the previous frame, by at least ENTER_MIN_STEP px).
+# LINE1 is kept ONLY to define which way is "inward" (its sign) -- not as a
+# crossing line. Mark ENTREE_ZONE over the doorway with the polygon picker.
+LINE1_START, LINE1_END = sv.Point(1725, 820), sv.Point(1630, 1078)   # inward-direction reference
+ENTREE_ZONE = [
+     [(1892, 902), (1725, 828), (1628, 1068), (1851, 1066), (1890, 902)]
+]
+_ENTREE_POLYS  = [np.array(z, np.int32) for z in ENTREE_ZONE if len(z) >= 3]
+ENTER_SIGN     = +1   # [^] +1: inward = signed-dist INCREASES; flip to -1 if backwards
+ENTER_MIN_STEP = 1    # [^] min inward movement (px) per processed frame to count as "forward"
 
 # --- PEC (interaction) -------------------------------------------------------
 PEC_PROX_DIST   = 350   # [^] px bbox-gap to a seller to count as "at the counter"
@@ -119,7 +128,11 @@ MIRROR_ZONES = [
 ]
 SELLER_ZONES = [
     [(198, 851), (478, 696), (1001, 1001), (1086, 1068), (325, 1068), (196, 854)],
+    [(964, 887), (1416, 893), (1428, 1068), (894, 1069), (959, 888)],
+    [(161, 780), (471, 674), (494, 704), (201, 847), (161, 786)]
 ]
+SELLER_ZONE_FRAC = 0.50   # [^] fraction of a person's BOX that must be inside a SELLER zone
+                          #     (draw the zone over the staff BODY area, not just floor)
 IGNORE_ZONES = [
     [(1789, 663), (1838, 680), (1819, 768), (1769, 750), (1788, 665)],   # handbag on shelf
 ]
@@ -208,13 +221,28 @@ def in_ignore_zone(xyxy: np.ndarray) -> np.ndarray:
 
 
 def in_seller_zone(bbox) -> bool:
-    """True if a person's feet (bottom-center) fall inside any SELLER zone."""
+    """True if at least SELLER_ZONE_FRAC of the person's BOX is inside a SELLER
+    zone (grid-sampled). Box-overlap (not just feet) rejects a client whose feet
+    clip the zone while their body is outside -- but the zone must then cover the
+    staff's BODY area (a tall region), not just a floor strip."""
     if not _SELLER_POLYS:
         return False
-    fx = (bbox[0] + bbox[2]) / 2.0
-    fy = bbox[3]
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    if x2 <= x1 or y2 <= y1:
+        return False
+    inside = total = 0
+    for px in np.linspace(x1, x2, 6):
+        for py in np.linspace(y1, y2, 6):
+            total += 1
+            if any(cv2.pointPolygonTest(poly, (px, py), False) >= 0 for poly in _SELLER_POLYS):
+                inside += 1
+    return (inside / total) >= SELLER_ZONE_FRAC
+
+
+def in_entree_zone(fx, fy) -> bool:
+    """True if the point (feet = bottom-center) falls inside any ENTREE zone."""
     return any(cv2.pointPolygonTest(poly, (float(fx), float(fy)), False) >= 0
-               for poly in _SELLER_POLYS)
+               for poly in _ENTREE_POLYS)
 
 
 def torso_white_ratio(frame: np.ndarray, bbox) -> float:
@@ -360,7 +388,7 @@ class UniformModel:
 # =============================================================
 #  Drawing  (no ids)
 # =============================================================
-def draw_frame(frame, persons, in_count, pec_count=0):
+def draw_frame(frame, persons, entry_count, pec_count=0):
     SELLER_COLOR = (0, 0, 255)
     CLIENT_COLOR = (0, 200, 0)
     for bbox, role in persons:
@@ -379,7 +407,9 @@ def draw_frame(frame, persons, in_count, pec_count=0):
         cv2.polylines(frame, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
     for poly in _IGNORE_POLYS:
         cv2.polylines(frame, [poly], True, (128, 128, 128), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"Clients: {in_count}  PEC: {pec_count}",
+    for poly in _ENTREE_POLYS:                                   # entrance counting zone
+        cv2.polylines(frame, [poly], True, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Entries: {entry_count}  PEC: {pec_count}",
                 (max(10, LINE1_START.x - 320), LINE1_START.y - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     return frame
@@ -415,10 +445,9 @@ def main():
 
     seller_tracks = set()                     # BoT-SORT ids confirmed SELLER (sticky)
     seller_votes = {}                         # track_id -> uniform-match frame count
-    in_count   = 0
-    pending_out = []                          # (cx, cy, frame) seen just-OUTSIDE near line
-    recent_counts = []                        # (cx, cy, frame) already counted -> cooldown
-    dbg = {"out_ev": 0, "in_ev": 0}
+    entry_count = 0                           # clients counted entering via the ENTREE zone
+    entered_ids = set()                       # track ids already counted (dedup)
+    prev_d = {}                               # track_id -> last signed distance (for direction)
 
     pec_active = False
     pec_count = 0
@@ -437,7 +466,7 @@ def main():
     with sv.VideoSink(TARGET_VIDEO_PATH, video_info) as sink:
         for frame_idx, frame in enumerate(generator):
             if frame_idx % SKIP != 0:
-                draw_frame(frame, last_persons, in_count, pec_count)
+                draw_frame(frame, last_persons, entry_count, pec_count)
                 sink.write_frame(frame)
                 continue
             if MAX_FRAMES and processed_frame_idx + 1 >= MAX_FRAMES:
@@ -526,35 +555,26 @@ def main():
                     continue
                 persons.append((bbox, role))
 
-                # entry counting: id-FREE position match (out -> in across the line)
-                if role == "CLIENT":
-                    cx = (bbox[0] + bbox[2]) / 2
-                    cy = (bbox[1] + bbox[3]) / 2
-                    d  = signed_dist_to_line((cx, cy), LINE1_START, LINE1_END)
-                    pf = processed_frame_idx
-                    if -CROSS_NEAR_PX < d < -DEADZONE_PX:           # just OUTSIDE, near line
-                        pending_out.append((cx, cy, pf))
-                        if DEBUG_CALIB:
-                            dbg["out_ev"] += 1
-                    elif DEADZONE_PX < d < CROSS_NEAR_PX:           # just INSIDE, near line
-                        if DEBUG_CALIB:
-                            dbg["in_ev"] += 1
-                        cooling = any(pf - cf <= COOLDOWN and np.hypot(cx - rx, cy - ry) <= MATCH_DIST_PX
-                                      for rx, ry, cf in recent_counts)
-                        if not cooling:
-                            match = next((e for e in pending_out
-                                          if pf - e[2] <= MATCH_WIN
-                                          and np.hypot(cx - e[0], cy - e[1]) <= MATCH_DIST_PX), None)
-                            if match is not None:
-                                in_count += 1
-                                recent_counts.append((cx, cy, pf))
-                                mx, my = match[0], match[1]
-                                pending_out = [e for e in pending_out
-                                               if np.hypot(e[0] - mx, e[1] - my) > MATCH_DIST_PX]
-                                print(f"[CNT] f{pf} ENTRY at ({cx:.0f},{cy:.0f}) d={d:+.0f} "
-                                      f"-> Clients={in_count}")
-                    pending_out   = [e for e in pending_out   if pf - e[2] <= MATCH_WIN]
-                    recent_counts = [e for e in recent_counts if pf - e[2] <= COOLDOWN]
+                # ENTREE-ZONE counter (4 conditions). Uses the person's FEET
+                # (bottom-center) -- where they actually stand in the doorway --
+                # not the box center (a tall box's center sits above a low zone).
+                # Count a CLIENT once when its FEET are inside ENTREE_ZONE, its id
+                # wasn't counted before, and it is moving INTO the shop (signed-dist
+                # to LINE1 moved inward since last frame by >= ENTER_MIN_STEP).
+                if role == "CLIENT" and tid is not None:
+                    fx = (bbox[0] + bbox[2]) / 2           # feet: x-center
+                    fy = bbox[3]                           # feet: box bottom
+                    d  = signed_dist_to_line((fx, fy), LINE1_START, LINE1_END)
+                    pd = prev_d.get(tid)
+                    if (_ENTREE_POLYS and in_entree_zone(fx, fy)          # (1) feet in entree zone
+                            and tid not in entered_ids                    # (2) new id
+                            and pd is not None
+                            and ENTER_SIGN * (d - pd) >= ENTER_MIN_STEP):  # (4) moving inward
+                        entry_count += 1
+                        entered_ids.add(tid)
+                        print(f"[CNT] f{processed_frame_idx} ENTER tid={tid} "
+                              f"-> count={entry_count}")
+                    prev_d[tid] = d                          # update direction memory
 
             # 4b) PEC: ONE engagement, anchored to the SERVED client's POSITION
             seller_boxes = [b for b, r in persons if r == "SELLER"]
@@ -599,7 +619,7 @@ def main():
             # else: no seller visible -> pause the PEC
 
             # 5) Draw + write
-            draw_frame(frame, persons, in_count, pec_count)
+            draw_frame(frame, persons, entry_count, pec_count)
             sink.write_frame(frame)
             last_persons = persons
 
@@ -623,10 +643,9 @@ def main():
             lo, hi = b
             print(f"\n[CALIB] uniform beige band  H:[{lo[0]:.0f},{hi[0]:.0f}] "
                   f"S:[{lo[1]:.0f},{hi[1]:.0f}] V:[{lo[2]:.0f},{hi[2]:.0f}]")
-        print(f"[CNT-DBG] near-line events: out={dbg['out_ev']}  in={dbg['in_ev']}")
 
     print("\n========== RESULT ==========")
-    print(f"Clients entered  : {in_count}")
+    print(f"Clients entered  : {entry_count}")
     print(f"PEC events       : {pec_count}")
     print(f"Avg interaction  : {avg_pec:.1f} s")
     print(f"Output video     : {TARGET_VIDEO_PATH}")
