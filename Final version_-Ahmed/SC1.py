@@ -44,7 +44,7 @@ from boxmot.trackers.tracker_zoo import create_tracker
 # =============================================================
 # --- videos (set these to your files) ---------------------------------------
 SOURCE_VIDEO_PATH = "testvid_playable.mp4"   # <-- INPUT video
-TARGET_VIDEO_PATH = "SC_output3.mp4"          # <-- OUTPUT annotated video
+TARGET_VIDEO_PATH = "SC_output1.mp4"          # <-- OUTPUT annotated video
 
 # --- models ------------------------------------------------------------------
 MODEL_NAME = "yolo11m.pt"                     # YOLO person detector (auto-downloads)
@@ -153,7 +153,9 @@ SELLER_ZONES = [
 SELLER_ZONE_FRAC = 0.70   # [^] fraction of a person's BOX that must be inside a SELLER zone
                           #     (draw the zone over the staff BODY area, not just floor)
 IGNORE_ZONES = [
-    [(1789, 663), (1838, 680), (1819, 768), (1769, 750), (1788, 665)],   # handbag on shelf
+            [(1789, 663), (1838, 680), (1819, 768), (1769, 750), (1788, 665)],
+            [(404, 753), (649, 1068), (914, 941), (588, 651), (408, 750)],
+            [(502, 674), (471, 661), (316, 740), (329, 794), (501, 681)]
 ]
 _MIRROR_POLYS = [np.array(z, np.int32) for z in MIRROR_ZONES if len(z) >= 3]
 _SELLER_POLYS = [np.array(z, np.int32) for z in SELLER_ZONES if len(z) >= 3]
