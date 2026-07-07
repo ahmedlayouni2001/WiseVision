@@ -10,8 +10,10 @@ What it does, per processed frame:
      SELLER_VOTES matching frames the track is locked SELLER and stays SELLER on
      every later frame (anti-flicker). A staff-desk ZONE also forces SELLER (for a
      seated staffer whose pants are hidden). Everyone else is CLIENT (no id shown).
-  3) ENTRY COUNT: a CLIENT crossing the line OUT->IN is counted, matched by
-     POSITION (not track id) so BoT-SORT id churn at the crossing can't break it.
+  3) ENTRY COUNT: a CLIENT is counted +1 when they pass ENTER_ZONE_1 then
+     ENTER_ZONE_2 (that order = entering). Passing 2->1 (leaving) or touching only
+     one zone counts nothing. Matched by POSITION (not track id), so BoT-SORT id
+     churn at the doorway can't break it, and direction needs no line/inward math.
   4) PEC (interaction): one engagement at a time, anchored to the served client's
      POSITION; counted after PEC_MIN_SECS of continuous contact with any seller.
   5) MIRROR zones drop reflections; IGNORE zones drop static false detections.
@@ -42,7 +44,7 @@ from boxmot.trackers.tracker_zoo import create_tracker
 # =============================================================
 # --- videos (set these to your files) ---------------------------------------
 SOURCE_VIDEO_PATH = "testvid_playable.mp4"   # <-- INPUT video
-TARGET_VIDEO_PATH = "SC_output.mp4"          # <-- OUTPUT annotated video
+TARGET_VIDEO_PATH = "SC_output3.mp4"          # <-- OUTPUT annotated video
 
 # --- models ------------------------------------------------------------------
 MODEL_NAME = "yolo11m.pt"                     # YOLO person detector (auto-downloads)
@@ -51,7 +53,7 @@ DEVICE         = "cuda:0" if torch.cuda.is_available() else "cpu"
 HALF_PRECISION = torch.cuda.is_available()
 
 # --- detection / general -----------------------------------------------------
-DETECT_CONF     = 0.1     # low YOLO conf -> still catch faint SELLERS (clients filtered later)
+DETECT_CONF     = 0.1    # low YOLO conf -> still catch faint SELLERS (clients filtered later)
 CONF_CLIENT     = 0.2     # min conf for a CLIENT to be kept/counted (sellers exempt)
 PERSON_CLASS_ID = 0
 SKIP            = 3       # process every SKIP-th frame
@@ -81,7 +83,7 @@ COLOR_PCT_HI = 95     # [^]
 COLOR_MARGIN = np.array([4, 15, 30])           # H,S,V padding around the learned band (re-learn only)
 COLOR_TAKE   = 0.30   # [^] fraction of lower-body pixels inside the band to call "uniform"
 WHITE_MIN    = 0.25   # [^] white-top ratio required (white tops are shared, keep modest)
-SELLER_VOTES = 2     # [^] uniform-match frames before a track locks SELLER (anti-flicker)
+SELLER_VOTES = 2  # [^] uniform-match frames before a track locks SELLER (anti-flicker)
 
 # beige pants HSV gate (broad pre-gate when re-learning) + white-top gate
 BEIGE_H_MIN, BEIGE_H_MAX = 22, 55
@@ -92,27 +94,42 @@ WHITE_V_MIN = 85
 
 # --- SEED window -------------------------------------------------------------
 SEED_SECONDS   = 3.0     # everyone detected before this is SELLER (+ teaches color if re-learning)
-SEED_BEIGE_MIN = 0.15    # only sample pants color from seed people who actually show beige
+SEED_BEIGE_MIN = 0.05    # only sample pants color from seed people who actually show beige
 
-# --- ENTREE-ZONE counter (replaces the line) ---------------------------------
-# Count a CLIENT once when ALL 4 hold:
-#   (1) its FEET (bottom-center) are inside ENTREE_ZONE,
-#   (2) its track id has not been counted before,
-#   (3) it is a CLIENT,
-#   (4) it is moving INTO the shop (its signed distance to LINE1 moved inward
-#       since the previous frame, by at least ENTER_MIN_STEP px).
-# LINE1 is kept ONLY to define which way is "inward" (its sign) -- not as a
-# crossing line. Mark ENTREE_ZONE over the doorway with the polygon picker.
-LINE1_START, LINE1_END = sv.Point(1725, 820), sv.Point(1630, 1078)   # inward-direction reference
-ENTREE_ZONE = [
-     [(1892, 902), (1725, 828), (1628, 1068), (1851, 1066), (1890, 902)]
+# --- ENTRY = ORDERED TWO-ZONE pass (direction comes from the ORDER, no line) --
+# Two zones across the doorway. A CLIENT is counted +1 only when they pass
+#   ENTER_ZONE_1  THEN  ENTER_ZONE_2   (this direction = ENTERING the shop).
+# Passing 2 THEN 1 (leaving) or touching only ONE zone => NOT counted.
+# "In a zone" = >= ENTER_ZONE_FRAC of the person BOX overlaps it (grid-sampled),
+# the same overlap rule the old ENTREE zone used. Direction is purely the visiting
+# order -- no LINE / signed-distance / inward math anymore.
+# DRAW BOTH with "tools for help/pick_zones.py":
+#   ZONE 1 = the side crossed FIRST when entering (door / outside).
+#   ZONE 2 = the side reached SECOND when entering (shop interior).
+# ZONE_1 below is your existing doorway polygon; ZONE_2 is a placeholder just
+# inside it -- REDRAW ZONE_2 (and swap 1<->2 if it counts exits instead of entries).
+ENTER_ZONE_1 = [
+    [(1909, 708), (1909, 1068), (1715, 1065), (1822, 685), (1908, 708)]    # door side (crossed first)
+    
 ]
-_ENTREE_POLYS  = [np.array(z, np.int32) for z in ENTREE_ZONE if len(z) >= 3]
-ENTER_SIGN     = +1   # [^] +1: inward = signed-dist INCREASES; flip to -1 if backwards
-ENTER_MIN_STEP = 1    # [^] min inward movement (px) per processed frame to count as "forward"
+ENTER_ZONE_2 = [
+    [(1682, 1055), (1790, 680), (1732, 663), (1602, 1066), (1686, 1053)]     # shop side (reached second) -- REDRAW
+    
+]
+ENTER_ZONE_FRAC = 0.11  # [^] >= this fraction of the BOX must overlap a zone to be "in" it
+_ENTER_POLYS_1 = [np.array(z, np.int32) for z in ENTER_ZONE_1 if len(z) >= 3]
+_ENTER_POLYS_2 = [np.array(z, np.int32) for z in ENTER_ZONE_2 if len(z) >= 3]
+# id-FREE matching (so a client with NO BoT-SORT id is still tracked across zones):
+ZONE_MATCH_DIST = 170  # [^] px to link a client to its track between frames (no id)
+ZONE_TTL        = 20    # processed-frames a track survives unseen before expiring
+
+# --- REVERT a mis-counted entry -----------------------------------------------
+# A real seller can be briefly mis-read as a CLIENT at the doorway and counted +1.
+# If that SAME track id is later CONFIRMED as SELLER within ENTRY_REVERT_SECS,
+ENTRY_REVERT_SECS = 6.0  # [^] window after an entry in which a SELLER flip cancels it
 
 # --- PEC (interaction) -------------------------------------------------------
-PEC_PROX_DIST   = 350   # [^] px bbox-gap to a seller to count as "at the counter"
+PEC_PROX_DIST   = 200   # [^] px bbox-gap to a seller to count as "at the counter"
 PEC_MIN_SECS    = 8.0   # [^] continuous engagement before it counts (rejects pass-bys)
 PEC_GRACE_SECS  = 12    # [^] engagement survives this long with the served client unseen
 PEC_FOLLOW_DIST = 160   # px the served client may move and still be "the same one"
@@ -129,9 +146,11 @@ MIRROR_ZONES = [
 SELLER_ZONES = [
     [(198, 851), (478, 696), (1001, 1001), (1086, 1068), (325, 1068), (196, 854)],
     [(964, 887), (1416, 893), (1428, 1068), (894, 1069), (959, 888)],
-    [(161, 780), (471, 674), (494, 704), (201, 847), (161, 786)]
+    [(161, 780), (471, 674), (494, 704), (201, 847), (161, 786)],
+     [(1008, 255), (992, 140), (1152, 146), (1159, 247), (1008, 255)],
+    [(695, 666), (592, 565), (528, 381), (705, 323), (732, 387), (698, 665)]
 ]
-SELLER_ZONE_FRAC = 0.50   # [^] fraction of a person's BOX that must be inside a SELLER zone
+SELLER_ZONE_FRAC = 0.70   # [^] fraction of a person's BOX that must be inside a SELLER zone
                           #     (draw the zone over the staff BODY area, not just floor)
 IGNORE_ZONES = [
     [(1789, 663), (1838, 680), (1819, 768), (1769, 750), (1788, 665)],   # handbag on shelf
@@ -239,10 +258,21 @@ def in_seller_zone(bbox) -> bool:
     return (inside / total) >= SELLER_ZONE_FRAC
 
 
-def in_entree_zone(fx, fy) -> bool:
-    """True if the point (feet = bottom-center) falls inside any ENTREE zone."""
-    return any(cv2.pointPolygonTest(poly, (float(fx), float(fy)), False) >= 0
-               for poly in _ENTREE_POLYS)
+def box_overlap_frac(bbox, polys) -> float:
+    """Fraction of the person's BOX (grid-sampled) that falls inside any of `polys`.
+    Used to decide if a person is 'in' an ENTER zone (>= ENTER_ZONE_FRAC)."""
+    if not polys:
+        return 0.0
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inside = total = 0
+    for px in np.linspace(x1, x2, 6):
+        for py in np.linspace(y1, y2, 6):
+            total += 1
+            if any(cv2.pointPolygonTest(poly, (px, py), False) >= 0 for poly in polys):
+                inside += 1
+    return inside / total if total else 0.0
 
 
 def torso_white_ratio(frame: np.ndarray, bbox) -> float:
@@ -399,19 +429,20 @@ def draw_frame(frame, persons, entry_count, pec_count=0):
         cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
         cv2.putText(frame, role, (x1 + 2, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.line(frame, (LINE1_START.x, LINE1_START.y), (LINE1_END.x, LINE1_END.y),
-             (0, 200, 255), 2, cv2.LINE_AA)
     for poly in _MIRROR_POLYS:
         cv2.polylines(frame, [poly], True, (255, 0, 255), 2, cv2.LINE_AA)
     for poly in _SELLER_POLYS:
         cv2.polylines(frame, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
     for poly in _IGNORE_POLYS:
         cv2.polylines(frame, [poly], True, (128, 128, 128), 2, cv2.LINE_AA)
-    for poly in _ENTREE_POLYS:                                   # entrance counting zone
+    for poly in _ENTER_POLYS_1:                                  # entry zone 1 (crossed first)
         cv2.polylines(frame, [poly], True, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, "1", tuple(poly[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+    for poly in _ENTER_POLYS_2:                                  # entry zone 2 (reached second)
+        cv2.polylines(frame, [poly], True, (255, 200, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame, "2", tuple(poly[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 200, 0), 2)
     cv2.putText(frame, f"Entries: {entry_count}  PEC: {pec_count}",
-                (max(10, LINE1_START.x - 320), LINE1_START.y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     return frame
 
 
@@ -445,14 +476,15 @@ def main():
 
     seller_tracks = set()                     # BoT-SORT ids confirmed SELLER (sticky)
     seller_votes = {}                         # track_id -> uniform-match frame count
-    entry_count = 0                           # clients counted entering via the ENTREE zone
-    entered_ids = set()                       # track ids already counted (dedup)
-    prev_d = {}                               # track_id -> last signed distance (for direction)
+    entry_count = 0                           # clients counted entering (zone 1 -> zone 2)
+    zone_objs = []                            # id-FREE tracks: [cx, cy, last_zone, counted, last_frame]
+    entry_by_tid = {}                         # track_id -> timestamp it was counted as an ENTERING client
 
     pec_active = False
     pec_count = 0
     pec_start_t = None
     pec_last_t = None
+    pec_seen_secs = 0.0                        # accumulated REAL contact time (not wall-clock)
     pec_pos = None
     pec_counted = False
     pec_durations = []
@@ -527,9 +559,18 @@ def main():
                     if tid is not None:
                         seller_tracks.add(tid)
                 else:
+                    # PER-FRAME WHITE GATE: verify a WHITE top in THIS frame FIRST.
+                    # No white now -> CLIENT, ALWAYS (even if the track locked SELLER
+                    # earlier / during SEED). Only when white is present do we check the
+                    # beige pants and (vote-)lock / keep the SELLER role. This is what
+                    # stops a locked track (e.g. a blue-polo client seen during SEED)
+                    # from staying SELLER forever.
                     is_unif, color, white = uniform.is_uniform(frame, bbox)
-                    if tid is not None:
-                        if is_unif:
+                    has_white = white >= WHITE_MIN
+                    if not has_white:
+                        role = "CLIENT"                     # no white this frame -> never SELLER
+                    elif tid is not None:
+                        if is_unif:                         # white AND beige -> vote toward lock
                             seller_votes[tid] = seller_votes.get(tid, 0) + 1
                             if seller_votes[tid] >= SELLER_VOTES:
                                 seller_tracks.add(tid)
@@ -550,31 +591,66 @@ def main():
                     if tid is not None:
                         seller_tracks.add(tid)
 
+                # REVERT: a track we counted as an ENTERING client that is now SELLER
+                # (real staff mis-read at the doorway) -- undo the +1 if it flips within
+                # ENTRY_REVERT_SECS. Fires once per counted track (entry then removed).
+                if role == "SELLER" and tid is not None and tid in entry_by_tid:
+                    if timestamp - entry_by_tid[tid] <= ENTRY_REVERT_SECS and entry_count > 0:
+                        entry_count -= 1
+                        print(f"[CNT] f{processed_frame_idx} REVERT -1 (tid {tid} became "
+                              f"SELLER {timestamp - entry_by_tid[tid]:.1f}s after entry) "
+                              f"-> count={entry_count}")
+                    del entry_by_tid[tid]
+
                 # drop very low-confidence clients (junk boxes)
                 if role == "CLIENT" and conf < CONF_CLIENT:
                     continue
                 persons.append((bbox, role))
 
-                # ENTREE-ZONE counter (4 conditions). Uses the person's FEET
-                # (bottom-center) -- where they actually stand in the doorway --
-                # not the box center (a tall box's center sits above a low zone).
-                # Count a CLIENT once when its FEET are inside ENTREE_ZONE, its id
-                # wasn't counted before, and it is moving INTO the shop (signed-dist
-                # to LINE1 moved inward since last frame by >= ENTER_MIN_STEP).
-                if role == "CLIENT" and tid is not None:
-                    fx = (bbox[0] + bbox[2]) / 2           # feet: x-center
-                    fy = bbox[3]                           # feet: box bottom
-                    d  = signed_dist_to_line((fx, fy), LINE1_START, LINE1_END)
-                    pd = prev_d.get(tid)
-                    if (_ENTREE_POLYS and in_entree_zone(fx, fy)          # (1) feet in entree zone
-                            and tid not in entered_ids                    # (2) new id
-                            and pd is not None
-                            and ENTER_SIGN * (d - pd) >= ENTER_MIN_STEP):  # (4) moving inward
-                        entry_count += 1
-                        entered_ids.add(tid)
-                        print(f"[CNT] f{processed_frame_idx} ENTER tid={tid} "
-                              f"-> count={entry_count}")
-                    prev_d[tid] = d                          # update direction memory
+                # ORDERED TWO-ZONE entry counter, id-FREE. We track each client by
+                # POSITION (box center, not BoT-SORT id) -- so a client with NO track
+                # id (occluded) is still followed across the two zones. We remember the
+                # last ENTER zone the person was inside; a 1->2 transition = ENTERING
+                # (+1). A 2->1 transition (leaving) or touching only one zone counts
+                # nothing. Direction is the visiting ORDER -- no line / inward math.
+                if role == "CLIENT":
+                    f1 = box_overlap_frac(bbox, _ENTER_POLYS_1)
+                    f2 = box_overlap_frac(bbox, _ENTER_POLYS_2)
+                    cz = 0                                  # current zone: 0=neither, 1, or 2
+                    if f1 >= ENTER_ZONE_FRAC or f2 >= ENTER_ZONE_FRAC:
+                        cz = 1 if f1 >= f2 else 2
+                    cx = (bbox[0] + bbox[2]) / 2.0          # box center (matching point)
+                    cy = (bbox[1] + bbox[3]) / 2.0
+                    pf = processed_frame_idx
+                    # link to the nearest recent track (by position, id-free)
+                    best = None; best_dist = ZONE_MATCH_DIST
+                    for o in zone_objs:
+                        if pf - o[4] <= ZONE_TTL:
+                            dd = np.hypot(cx - o[0], cy - o[1])
+                            if dd < best_dist:
+                                best_dist = dd; best = o
+                    if best is None:
+                        # start a track only once the person is actually in a zone
+                        if cz != 0:
+                            zone_objs.append([cx, cy, cz, False, pf])  # [cx,cy,last_zone,counted,last_frame]
+                    else:
+                        prev_zone = best[2]
+                        if cz != 0 and cz != prev_zone:     # a zone transition happened
+                            if prev_zone == 1 and cz == 2 and not best[3]:
+                                entry_count += 1
+                                best[3] = True              # counted -> don't recount this pass
+                                if tid is not None:         # remember id so a later SELLER flip can revert it
+                                    entry_by_tid[tid] = timestamp
+                                print(f"[CNT] f{pf} ENTER (1->2) at ({cx:.0f},{cy:.0f}) "
+                                      f"-> count={entry_count}")
+                            best[2] = cz                    # 2->1 (leaving) just updates, no count
+                        best[0], best[1], best[4] = cx, cy, pf   # keep position/frame fresh
+
+            # expire stale in-zone tracks (id-free entree counter)
+            zone_objs = [o for o in zone_objs if processed_frame_idx - o[4] <= ZONE_TTL]
+            # forget entrants past the revert window (so a reused id can't falsely revert)
+            entry_by_tid = {t: ts for t, ts in entry_by_tid.items()
+                            if timestamp - ts <= ENTRY_REVERT_SECS}
 
             # 4b) PEC: ONE engagement, anchored to the SERVED client's POSITION
             seller_boxes = [b for b, r in persons if r == "SELLER"]
@@ -601,12 +677,13 @@ def main():
                         pec_pos = (PEC_EMA * pec_pos[0] + (1 - PEC_EMA) * best[0],
                                    PEC_EMA * pec_pos[1] + (1 - PEC_EMA) * best[1])
                         pec_last_t = timestamp
-                        if not pec_counted and timestamp - pec_start_t >= PEC_MIN_SECS:
-                            pec_count += 1
+                        pec_seen_secs += SKIP / fps                 # +1 processed-frame of REAL contact
+                        if not pec_counted and pec_seen_secs >= PEC_MIN_SECS:
+                            pec_count += 1                          # 5 s of CUMULATIVE presence reached
                             pec_counted = True
                     elif timestamp - pec_last_t > PEC_GRACE_SECS:   # served client gone
                         if pec_counted:
-                            pec_durations.append(pec_last_t - pec_start_t)
+                            pec_durations.append(pec_seen_secs)     # real contact time, not wall-clock
                         pec_active = False; pec_pos = None
                 else:
                     if contacts:
@@ -616,6 +693,7 @@ def main():
                         pec_active = True; pec_counted = False
                         pec_pos = served
                         pec_start_t = timestamp; pec_last_t = timestamp
+                        pec_seen_secs = 0.0                         # reset cumulative contact timer
             # else: no seller visible -> pause the PEC
 
             # 5) Draw + write
@@ -629,8 +707,8 @@ def main():
             timed_frames   += 1
 
     # close an engagement still open at end of footage
-    if pec_active and pec_counted and pec_start_t is not None and pec_last_t is not None:
-        pec_durations.append(pec_last_t - pec_start_t)
+    if pec_active and pec_counted:
+        pec_durations.append(pec_seen_secs)        # real contact time, not wall-clock
     avg_pec = (sum(pec_durations) / len(pec_durations)) if pec_durations else 0.0
 
     del model, botsort
@@ -645,6 +723,7 @@ def main():
                   f"S:[{lo[1]:.0f},{hi[1]:.0f}] V:[{lo[2]:.0f},{hi[2]:.0f}]")
 
     print("\n========== RESULT ==========")
+    print(f"Processed frames : {timed_frames}")
     print(f"Clients entered  : {entry_count}")
     print(f"PEC events       : {pec_count}")
     print(f"Avg interaction  : {avg_pec:.1f} s")
