@@ -43,7 +43,7 @@ from boxmot.trackers.tracker_zoo import create_tracker
 #  CONFIG  (everything is here)
 # =============================================================
 # --- videos (set these to your files) ---------------------------------------
-SOURCE_VIDEO_PATH = "testvid_clean.mp4"   # <-- INPUT video
+SOURCE_VIDEO_PATH = "testvid_playable.mp4"   # <-- INPUT video
 TARGET_VIDEO_PATH = "SC_output11.mp4"          # <-- OUTPUT annotated video
 
 # --- models ------------------------------------------------------------------
