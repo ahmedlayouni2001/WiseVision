@@ -43,8 +43,8 @@ from boxmot.trackers.tracker_zoo import create_tracker
 #  CONFIG  (everything is here)
 # =============================================================
 # --- videos (set these to your files) ---------------------------------------
-SOURCE_VIDEO_PATH = "testvid_playable.mp4"   # <-- INPUT video
-TARGET_VIDEO_PATH = "SC_output1.mp4"          # <-- OUTPUT annotated video
+SOURCE_VIDEO_PATH = "testvid_clean.mp4"   # <-- INPUT video
+TARGET_VIDEO_PATH = "SC_output11.mp4"          # <-- OUTPUT annotated video
 
 # --- models ------------------------------------------------------------------
 MODEL_NAME = "yolo11m.pt"                     # YOLO person detector (auto-downloads)
@@ -134,6 +134,28 @@ PEC_MIN_SECS    = 8.0   # [^] continuous engagement before it counts (rejects pa
 PEC_GRACE_SECS  = 12    # [^] engagement survives this long with the served client unseen
 PEC_FOLLOW_DIST = 160   # px the served client may move and still be "the same one"
 PEC_EMA         = 0.5   # served-position smoothing (0..1, higher = stickier)
+
+# --- PEC ZONES (count each interaction per area, sum = total) -----------------
+# 3 areas of the shop. When a PEC is counted, it is attributed to whichever zone
+# the SERVED CLIENT is standing in at that moment; the per-zone counts sum to the
+# total PEC. A PEC that happens outside all 3 zones still counts in the total but
+# is not attributed to a zone (so the zone sum can be < total -- draw the zones to
+# cover every serving area if you want sum == total).
+# DRAW these 3 polygons with "tools for help/pick_zones.py" (feet/center inside).
+PEC_ZONE_1 = [
+    [(1155, 57), (1009, 473), (1542, 696), (1858, 207), (1158, 56)]        # <-- REDRAW (left area)
+]
+PEC_ZONE_2 = [
+    [(1909, 422), (1658, 522), (1538, 726), (1909, 893), (1909, 422)]   # <-- REDRAW (middle area)
+]
+PEC_ZONE_3 = [
+    [(90, 271), (988, 35), (1002, 474), (270, 795), (92, 281)]  # <-- REDRAW (right area)
+]
+_PEC_ZONE_POLYS = [
+    [np.array(z, np.int32) for z in PEC_ZONE_1 if len(z) >= 3],
+    [np.array(z, np.int32) for z in PEC_ZONE_2 if len(z) >= 3],
+    [np.array(z, np.int32) for z in PEC_ZONE_3 if len(z) >= 3],
+]
 
 # --- zones (mark with a polygon picker; feet-in-polygon) ----------------------
 # MIRROR: drop reflected people. IGNORE: drop static false detections (e.g. a bag).
@@ -231,6 +253,15 @@ def _feet_in_polys(xyxy: np.ndarray, polys) -> np.ndarray:
         mask[i] = any(cv2.pointPolygonTest(p, (float(fx), float(fy)), False) >= 0
                       for p in polys)
     return mask
+
+
+def pec_zone_of_point(x: float, y: float) -> int:
+    """Which PEC zone (1, 2, or 3) contains the point (x, y). 0 = none.
+    Used to attribute a counted PEC to the area the served client stands in."""
+    for zi, polys in enumerate(_PEC_ZONE_POLYS):
+        if any(cv2.pointPolygonTest(p, (float(x), float(y)), False) >= 0 for p in polys):
+            return zi + 1
+    return 0
 
 
 def in_mirror_zone(xyxy: np.ndarray) -> np.ndarray:
@@ -420,9 +451,10 @@ class UniformModel:
 # =============================================================
 #  Drawing  (no ids)
 # =============================================================
-def draw_frame(frame, persons, entry_count, pec_count=0):
+def draw_frame(frame, persons, entry_count, pec_count=0, pec_zone_counts=(0, 0, 0)):
     SELLER_COLOR = (0, 0, 255)
     CLIENT_COLOR = (0, 200, 0)
+    PEC_ZONE_COLORS = [(0, 165, 255), (255, 128, 0), (200, 0, 200)]  # Z1, Z2, Z3
     for bbox, role in persons:
         x1, y1, x2, y2 = map(int, bbox)
         color = SELLER_COLOR if role == "SELLER" else CLIENT_COLOR
@@ -443,8 +475,16 @@ def draw_frame(frame, persons, entry_count, pec_count=0):
     for poly in _ENTER_POLYS_2:                                  # entry zone 2 (reached second)
         cv2.polylines(frame, [poly], True, (255, 200, 0), 2, cv2.LINE_AA)
         cv2.putText(frame, "2", tuple(poly[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 200, 0), 2)
+    for zi, polys in enumerate(_PEC_ZONE_POLYS):                 # PEC zones 1/2/3
+        for poly in polys:
+            cv2.polylines(frame, [poly], True, PEC_ZONE_COLORS[zi], 2, cv2.LINE_AA)
+            cv2.putText(frame, f"PEC-Z{zi + 1}", tuple(poly[0]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, PEC_ZONE_COLORS[zi], 2)
     cv2.putText(frame, f"Entries: {entry_count}  PEC: {pec_count}",
                 (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    z1, z2, z3 = pec_zone_counts
+    cv2.putText(frame, f"PEC  Z1:{z1}  Z2:{z2}  Z3:{z3}",
+                (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     return frame
 
 
@@ -484,6 +524,7 @@ def main():
 
     pec_active = False
     pec_count = 0
+    pec_zone_counts = [0, 0, 0]                 # PEC counted per zone (index 0->Z1 ...)
     pec_start_t = None
     pec_last_t = None
     pec_seen_secs = 0.0                        # accumulated REAL contact time (not wall-clock)
@@ -500,7 +541,7 @@ def main():
     with sv.VideoSink(TARGET_VIDEO_PATH, video_info) as sink:
         for frame_idx, frame in enumerate(generator):
             if frame_idx % SKIP != 0:
-                draw_frame(frame, last_persons, entry_count, pec_count)
+                draw_frame(frame, last_persons, entry_count, pec_count, pec_zone_counts)
                 sink.write_frame(frame)
                 continue
             if MAX_FRAMES and processed_frame_idx + 1 >= MAX_FRAMES:
@@ -683,6 +724,13 @@ def main():
                         if not pec_counted and pec_seen_secs >= PEC_MIN_SECS:
                             pec_count += 1                          # 5 s of CUMULATIVE presence reached
                             pec_counted = True
+                            pz = pec_zone_of_point(pec_pos[0], pec_pos[1])  # attribute to a zone
+                            if pz:
+                                pec_zone_counts[pz - 1] += 1
+                            print(f"[PEC] f{processed_frame_idx} +1 at "
+                                  f"({pec_pos[0]:.0f},{pec_pos[1]:.0f}) "
+                                  f"zone={pz or '-'} -> total={pec_count} "
+                                  f"Z{pec_zone_counts}")
                     elif timestamp - pec_last_t > PEC_GRACE_SECS:   # served client gone
                         if pec_counted:
                             pec_durations.append(pec_seen_secs)     # real contact time, not wall-clock
@@ -699,7 +747,7 @@ def main():
             # else: no seller visible -> pause the PEC
 
             # 5) Draw + write
-            draw_frame(frame, persons, entry_count, pec_count)
+            draw_frame(frame, persons, entry_count, pec_count, pec_zone_counts)
             sink.write_frame(frame)
             last_persons = persons
 
@@ -728,6 +776,8 @@ def main():
     print(f"Processed frames : {timed_frames}")
     print(f"Clients entered  : {entry_count}")
     print(f"PEC events       : {pec_count}")
+    print(f"PEC per zone     : Z1={pec_zone_counts[0]}  Z2={pec_zone_counts[1]}  "
+          f"Z3={pec_zone_counts[2]}  (sum={sum(pec_zone_counts)})")
     print(f"Avg interaction  : {avg_pec:.1f} s")
     print(f"Output video     : {TARGET_VIDEO_PATH}")
     if timed_frames > 0:
