@@ -142,7 +142,7 @@ ZONE_TTL        = 20   # processed-frames a track survives unseen before expirin
 # +1. If that SAME track id later locks SELLER within ENTRY_REVERT_SECS, undo the
 # +1 (they were staff, not a customer). Needs a track id at count time.
 ENTRY_REVERT_SECS = 4.0  # [^] window after an entry in which a SELLER flip cancels it
-REVERT_MIN_SELLER_SECS = 0.5  # [^] the SELLER role must PERSIST this long to revert; a
+REVERT_MIN_SELLER_SECS = 1  # [^] the SELLER role must PERSIST this long to revert; a
                             #     shorter flip is a momentary misread of a real client
                             #     and does NOT cancel the +1
 
